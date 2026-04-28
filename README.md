@@ -4,6 +4,10 @@ A1 Swap Mod Packer is an open-source implementation 3MF packer for Bambu Lab A1 
 
 It takes one or more A1-sliced `.3mf` files, repeats their plate G-code according to copy counts, inserts an external SwapMod ejection/swap G-code block, and writes a new packed `.3mf` that can be sent to the printer.
 
+![A1 Swap Mod Packer Screenshot](docs/GUI_window.webp)
+
+<img src="docs/a1_swapmod_realphoto.webp" width="50%" />
+
 ## Notes
 
 - This project contains no proprietary code. All functionalities were implemented independently by comparing the states before and after 3MF file generation.
