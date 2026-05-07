@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,7 +14,7 @@ if sys.platform.startswith("win") and "QT_QPA_PLATFORM" not in os.environ:
 
 try:
     from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, Qt, QTimer, QUrl
-    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont
+    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont, QKeyEvent, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -30,9 +32,11 @@ try:
         QMessageBox,
         QPushButton,
         QSpinBox,
+        QStyle,
         QTableWidget,
         QTableWidgetItem,
         QTextEdit,
+        QToolButton,
         QVBoxLayout,
         QWidget,
     )
@@ -47,9 +51,11 @@ from .core import (
     build_packed_3mf,
     format_duration,
     format_filament,
+    list_gcode_members,
     list_swap_gcode_files,
     read_3mf_summary,
 )
+from .builder import preview_members_for_gcode_member, resolve_output_gcode_member
 from .paths import default_patch_config_path, default_swap_gcode_dir, user_settings_path
 from .planning import (
     DEFAULT_OUTPUT_PATTERN,
@@ -62,6 +68,40 @@ from .planning import (
 )
 
 SUMMARY_ROLE = Qt.UserRole + 100
+PATH_ROLE = Qt.UserRole + 101
+
+ORDER_COLUMN = 0
+FILE_COLUMN = 1
+COPIES_COLUMN = 2
+TIME_COLUMN = 3
+FILAMENT_COLUMN = 4
+
+PREVIEW_IMAGE_RE = re.compile(r"^Metadata/plate_(\d+)(?:_small)?\.png$", re.IGNORECASE)
+
+
+def preview_image_sort_key(member_name: str) -> tuple[int, int, str]:
+    match = PREVIEW_IMAGE_RE.match(member_name)
+    plate_number = int(match.group(1)) if match else 9999
+    is_small = 1 if member_name.lower().endswith("_small.png") else 0
+    return (is_small, plate_number, member_name.lower())
+
+
+def first_preview_image_member(member_names: list[str], gcode_member: str | None = None) -> str | None:
+    available_members = set(member_names)
+    if gcode_member is not None:
+        candidates = [name for name in preview_members_for_gcode_member(gcode_member) if name in available_members]
+        if candidates:
+            return sorted(candidates, key=preview_image_sort_key)[0]
+    candidates = [name for name in member_names if PREVIEW_IMAGE_RE.match(name)]
+    if not candidates:
+        candidates = [
+            name
+            for name in member_names
+            if name.lower().startswith("metadata/") and name.lower().endswith(".png")
+        ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=preview_image_sort_key)[0]
 
 
 class SuccessToast(QLabel):
@@ -146,13 +186,26 @@ class SuccessToast(QLabel):
 
 
 class DropTableWidget(QTableWidget):
-    def __init__(self, on_files_dropped: Callable[[list[Path]], None], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        on_files_dropped: Callable[[list[Path]], None],
+        on_delete_pressed: Callable[[], None],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.on_files_dropped = on_files_dropped
+        self.on_delete_pressed = on_delete_pressed
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         self.viewport().installEventFilter(self)
         self.setDragDropMode(QAbstractItemView.DropOnly)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key_Delete and self.selectedIndexes():
+            self.on_delete_pressed()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if watched is self.viewport():
@@ -213,11 +266,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1180, 860)
+        self.resize(960, 860)
         self.setAcceptDrops(True)
         self._updating_table = False
         self._loading_settings = True
         self._settings = self.load_settings()
+        self._shared_growth_enabled = False
         self.build_ui()
         self.load_swap_gcode_to_combo()
         self.restore_settings_to_ui()
@@ -244,31 +298,63 @@ class MainWindow(QMainWindow):
     def build_ui(self) -> None:
         central = QWidget(self)
         root = QVBoxLayout(central)
+        self.root_layout = root
 
         file_group = QGroupBox("Input 3MF files")
+        self.file_group = file_group
         file_layout = QVBoxLayout(file_group)
-        self.table = DropTableWidget(self.add_paths)
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["3MF path", "Copies", "Time", "Filament"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        file_body = QHBoxLayout()
+        table_layout = QVBoxLayout()
+        self.table = DropTableWidget(self.add_paths, self.remove_selected)
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Order", "3MF file", "Copies", "Time", "Filament"])
+        self.table.horizontalHeader().setSectionResizeMode(ORDER_COLUMN, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(FILE_COLUMN, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(COPIES_COLUMN, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(TIME_COLUMN, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(FILAMENT_COLUMN, QHeaderView.ResizeToContents)
+        self.table.setColumnWidth(ORDER_COLUMN, 104)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.verticalHeader().hide()
+        self.table.setMinimumHeight(220)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setToolTip("Drag .3mf files or folders here. Folders add all top-level .3mf files.")
         self.table.itemChanged.connect(self.on_table_item_changed)
-        file_layout.addWidget(self.table)
+        self.table.itemSelectionChanged.connect(self.update_thumbnail_preview)
+        table_layout.addWidget(self.table)
 
         self.total_summary_label = QLabel("Total: 0 plates | Time: Unknown | Filament: Unknown")
-        file_layout.addWidget(self.total_summary_label)
+        table_layout.addWidget(self.total_summary_label)
+        file_body.addLayout(table_layout, 1)
+
+        preview_group = QGroupBox("Selected thumbnail")
+        preview_layout = QVBoxLayout(preview_group)
+        self.thumbnail_label = QLabel("Select an input file")
+        self.thumbnail_label.setAlignment(Qt.AlignCenter)
+        self.thumbnail_label.setFixedSize(280, 220)
+        self.thumbnail_label.setStyleSheet(
+            """
+            QLabel {
+                background: #f8f8f8;
+                border: 1px solid #cfcfcf;
+                color: #666;
+            }
+            """
+        )
+        self.thumbnail_name_label = QLabel("")
+        self.thumbnail_name_label.setWordWrap(True)
+        self.thumbnail_name_label.setMaximumWidth(280)
+        preview_layout.addWidget(self.thumbnail_label)
+        preview_layout.addWidget(self.thumbnail_name_label)
+        preview_layout.addStretch(1)
+        file_body.addWidget(preview_group)
+        file_layout.addLayout(file_body)
 
         file_buttons = QHBoxLayout()
         add_button = QPushButton("Add 3MF")
         remove_button = QPushButton("Remove")
         remove_all_button = QPushButton("Remove All")
-        up_button = QPushButton("Move Up")
-        down_button = QPushButton("Move Down")
         apply_default_copies_button = QPushButton("Apply Default Copies to Selected")
         self.build_button = QPushButton("Build 3MF")
         self.build_button.setMinimumHeight(64)
@@ -281,26 +367,28 @@ class MainWindow(QMainWindow):
         add_button.clicked.connect(self.add_files)
         remove_button.clicked.connect(self.remove_selected)
         remove_all_button.clicked.connect(self.remove_all)
-        up_button.clicked.connect(lambda: self.move_selected(-1))
-        down_button.clicked.connect(lambda: self.move_selected(1))
         apply_default_copies_button.clicked.connect(self.apply_default_copies_to_selected)
         self.build_button.clicked.connect(self.build_output)
 
-        for button in (add_button, remove_button, remove_all_button, up_button, down_button, apply_default_copies_button):
+        for button in (add_button, remove_button, remove_all_button, apply_default_copies_button):
+            button.setMinimumHeight(44)
             file_buttons.addWidget(button)
         file_buttons.addStretch(1)
         file_buttons.addWidget(self.build_button)
         file_layout.addLayout(file_buttons)
-        root.addWidget(file_group)
+        root.addWidget(file_group, 1)
 
         options_group = QGroupBox("Packing options")
         options_layout = QFormLayout(options_group)
 
         self.swap_gcode_combo = QComboBox()
-        self.swap_gcode_combo.setMinimumWidth(520)
+        self.swap_gcode_combo.setMinimumWidth(260)
+        self.swap_gcode_combo.setMaximumWidth(440)
         swap_gcode_row = QHBoxLayout()
         refresh_button = QPushButton("Refresh")
         open_folder_button = QPushButton("Open Folder")
+        refresh_button.setFixedWidth(refresh_button.sizeHint().width())
+        open_folder_button.setFixedWidth(open_folder_button.sizeHint().width())
         refresh_button.clicked.connect(self.load_swap_gcode_to_combo)
         open_folder_button.clicked.connect(self.open_swap_gcode_folder)
         swap_gcode_row.addWidget(self.swap_gcode_combo, 1)
@@ -311,6 +399,7 @@ class MainWindow(QMainWindow):
         self.default_copies_spin = QSpinBox()
         self.default_copies_spin.setRange(1, 9999)
         self.default_copies_spin.setValue(1)
+        self.default_copies_spin.setFixedWidth(96)
         options_layout.addRow("Default copies for new inputs", self.default_copies_spin)
 
         self.bed_cooldown_check = QCheckBox("Wait for bed cooldown")
@@ -329,6 +418,7 @@ class MainWindow(QMainWindow):
         self.wait_spin.setRange(0, 3600)
         self.wait_spin.setValue(45)
         self.wait_spin.setSuffix(" s")
+        self.wait_spin.setFixedWidth(96)
         options_layout.addRow("Wait after ejection", self.wait_spin)
 
         self.show_plate_number_check = QCheckBox("Show current plate in the hundreds digit of remaining time")
@@ -339,21 +429,21 @@ class MainWindow(QMainWindow):
         self.swap_final_check.setChecked(True)
         options_layout.addRow("Final swap", self.swap_final_check)
 
-        self.patch_check = QCheckBox("Apply editable G-code patches from gcode_patches.ini")
+        self.patch_check = QCheckBox("Apply editable G-code patches")
+        self.patch_check.setToolTip("Uses gcode_patches.ini")
         self.patch_check.setChecked(True)
         patch_row = QHBoxLayout()
-        patch_path_label = QLabel(str(default_patch_config_path()))
-        patch_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         open_patch_button = QPushButton("Open Config")
         open_patch_button.clicked.connect(self.open_patch_config)
         patch_row.addWidget(self.patch_check)
-        patch_row.addWidget(patch_path_label, 1)
         patch_row.addWidget(open_patch_button)
+        patch_row.addStretch(1)
         options_layout.addRow("G-code patches", patch_row)
 
         self.metadata_combo = QComboBox()
         self.metadata_combo.addItem("Keep source prediction and weight", "source")
         self.metadata_combo.addItem("Sum prediction and filament", "sum")
+        self.metadata_combo.setFixedWidth(260)
         options_layout.addRow("3MF metadata", self.metadata_combo)
 
         self.individual_batch_check = QCheckBox("Individual batch mode")
@@ -378,7 +468,10 @@ class MainWindow(QMainWindow):
         output_dir_row = QHBoxLayout()
         self.output_dir_edit = QLineEdit()
         self.output_dir_edit.setPlaceholderText("Leave empty to write next to the input file")
+        self.output_dir_edit.setMinimumWidth(280)
+        self.output_dir_edit.setMaximumWidth(560)
         browse_output_dir_button = QPushButton("Browse")
+        browse_output_dir_button.setFixedWidth(browse_output_dir_button.sizeHint().width())
         browse_output_dir_button.clicked.connect(self.choose_output_dir)
         output_dir_row.addWidget(self.output_dir_edit, 1)
         output_dir_row.addWidget(browse_output_dir_button)
@@ -386,6 +479,8 @@ class MainWindow(QMainWindow):
 
         self.output_name_edit = QLineEdit(DEFAULT_OUTPUT_PATTERN)
         self.output_name_edit.setPlaceholderText("Use tokens such as {source}, {sources}, {plates}, {copies}, {date}, {time}")
+        self.output_name_edit.setMinimumWidth(280)
+        self.output_name_edit.setMaximumWidth(560)
         filename_rule_row = QHBoxLayout()
         output_rule_help_button = QPushButton("?")
         output_rule_help_button.setFixedWidth(34)
@@ -395,17 +490,33 @@ class MainWindow(QMainWindow):
         filename_rule_row.addWidget(output_rule_help_button)
         output_layout.addRow("Output filename rule", filename_rule_row)
 
-        self.output_preview_label = QLabel("Output path preview: -")
+        self.output_preview_label = QLabel("-")
         output_layout.addRow("Preview", self.output_preview_label)
         root.addWidget(output_group)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(130)
-        root.addWidget(self.log)
+        self.log.setMinimumHeight(100)
+        root.addWidget(self.log, 0)
 
         self.setCentralWidget(central)
         self.success_toast = SuccessToast(central)
+        self.update_vertical_growth_policy()
+
+    def update_vertical_growth_policy(self) -> None:
+        if not hasattr(self, "root_layout") or not hasattr(self, "file_group") or not hasattr(self, "log"):
+            return
+        shared_growth = self.height() >= 980
+        if shared_growth == self._shared_growth_enabled:
+            return
+        self._shared_growth_enabled = shared_growth
+        self.root_layout.setStretchFactor(self.file_group, 4 if shared_growth else 1)
+        self.root_layout.setStretchFactor(self.log, 1 if shared_growth else 0)
+
+    def resizeEvent(self, event: QEvent) -> None:
+        super().resizeEvent(event)
+        self.update_vertical_growth_policy()
+        self.update_thumbnail_preview()
 
     def connect_option_signals(self) -> None:
         self.swap_gcode_combo.currentIndexChanged.connect(self.save_current_settings)
@@ -558,6 +669,98 @@ class MainWindow(QMainWindow):
         files, _ = QFileDialog.getOpenFileNames(self, "Add 3MF files", "", "3MF files (*.3mf);;All files (*)")
         self.add_paths([Path(file_name) for file_name in files])
 
+    def create_order_widget(self, row: int) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+
+        number_label = QLabel(str(row + 1))
+        number_label.setAlignment(Qt.AlignCenter)
+        number_label.setMinimumWidth(24)
+
+        up_button = QToolButton()
+        up_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        up_button.setToolTip("Move up")
+        up_button.setAutoRaise(True)
+        up_button.setFixedSize(28, 28)
+        up_button.setEnabled(row > 0)
+        up_button.clicked.connect(lambda _checked=False, current_row=row: self.move_row(current_row, -1))
+
+        down_button = QToolButton()
+        down_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+        down_button.setToolTip("Move down")
+        down_button.setAutoRaise(True)
+        down_button.setFixedSize(28, 28)
+        down_button.setEnabled(row < self.table.rowCount() - 1)
+        down_button.clicked.connect(lambda _checked=False, current_row=row: self.move_row(current_row, 1))
+
+        layout.addWidget(number_label)
+        layout.addWidget(up_button)
+        layout.addWidget(down_button)
+        return widget
+
+    def update_order_controls(self) -> None:
+        for row in range(self.table.rowCount()):
+            self.table.setCellWidget(row, ORDER_COLUMN, self.create_order_widget(row))
+            self.table.setCellWidget(row, COPIES_COLUMN, self.create_copies_spin(row, self.get_row_copies(row)))
+
+    def create_copies_spin(self, row: int, copies: int) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(1, 9999)
+        spin.setFixedWidth(78)
+        spin.setAlignment(Qt.AlignCenter)
+        spin.setValue(max(1, int(copies)))
+        spin.valueChanged.connect(lambda value, current_row=row: self.on_row_copies_changed(current_row, value))
+        return spin
+
+    def row_path(self, row: int) -> Path | None:
+        item = self.table.item(row, FILE_COLUMN)
+        if item is None:
+            return None
+        path_value = item.data(PATH_ROLE)
+        if path_value:
+            return Path(str(path_value))
+        return Path(item.text())
+
+    def load_thumbnail_pixmap(self, path: Path) -> QPixmap | None:
+        with zipfile.ZipFile(path, "r") as archive:
+            gcode_members = list_gcode_members(archive)
+            active_gcode_member = resolve_output_gcode_member(archive, gcode_members[0]) if gcode_members else None
+            member_name = first_preview_image_member(archive.namelist(), active_gcode_member)
+            if member_name is None:
+                return None
+            data = archive.read(member_name)
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data):
+            return None
+        return pixmap
+
+    def update_thumbnail_preview(self) -> None:
+        if not hasattr(self, "thumbnail_label"):
+            return
+        row = self.selected_row()
+        path = self.row_path(row) if row is not None else None
+        self.thumbnail_label.clear()
+        if path is None:
+            self.thumbnail_label.setText("Select an input file")
+            self.thumbnail_name_label.setText("")
+            return
+        self.thumbnail_name_label.setText(path.name)
+        try:
+            pixmap = self.load_thumbnail_pixmap(path)
+        except Exception as exc:
+            self.thumbnail_label.setText("Preview unavailable")
+            self.thumbnail_label.setToolTip(str(exc))
+            return
+        if pixmap is None:
+            self.thumbnail_label.setText("No preview image")
+            self.thumbnail_label.setToolTip("")
+            return
+        scaled = pixmap.scaled(self.thumbnail_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.thumbnail_label.setPixmap(scaled)
+        self.thumbnail_label.setToolTip(str(path))
+
     def add_paths(self, paths: list[Path]) -> None:
         expanded: list[Path] = []
         for path in paths:
@@ -567,7 +770,11 @@ class MainWindow(QMainWindow):
                 expanded.append(path)
         if not expanded:
             return
-        existing = {self.table.item(row, 0).text() for row in range(self.table.rowCount()) if self.table.item(row, 0)}
+        existing: set[str] = set()
+        for row in range(self.table.rowCount()):
+            current_path = self.row_path(row)
+            if current_path is not None:
+                existing.add(str(current_path))
         added = 0
         skipped = 0
         for path in expanded:
@@ -596,24 +803,29 @@ class MainWindow(QMainWindow):
         self._updating_table = True
         try:
             self.table.insertRow(row)
-            path_item = QTableWidgetItem(str(path))
+            path_item = QTableWidgetItem(path.name)
             path_item.setFlags(path_item.flags() & ~Qt.ItemIsEditable)
+            path_item.setData(PATH_ROLE, str(path))
             path_item.setData(SUMMARY_ROLE, self.summary_to_dict(summary))
-            path_item.setToolTip(self.base_summary_tooltip(summary))
-            copies_item = QTableWidgetItem(str(max(1, int(copies))))
-            copies_item.setTextAlignment(Qt.AlignCenter)
+            path_item.setToolTip(f"{path}\n\n{self.base_summary_tooltip(summary)}")
+            path_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             time_item = QTableWidgetItem("")
             filament_item = QTableWidgetItem("")
             for item in (time_item, filament_item):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.table.setItem(row, 0, path_item)
-            self.table.setItem(row, 1, copies_item)
-            self.table.setItem(row, 2, time_item)
-            self.table.setItem(row, 3, filament_item)
+            self.table.setCellWidget(row, ORDER_COLUMN, self.create_order_widget(row))
+            self.table.setItem(row, FILE_COLUMN, path_item)
+            self.table.setCellWidget(row, COPIES_COLUMN, self.create_copies_spin(row, copies))
+            self.table.setItem(row, TIME_COLUMN, time_item)
+            self.table.setItem(row, FILAMENT_COLUMN, filament_item)
+            self.table.setRowHeight(row, 38)
             self.update_row_stats(row)
         finally:
             self._updating_table = False
+        self.update_order_controls()
+        if self.table.rowCount() == 1:
+            self.table.selectRow(0)
         return True
 
     def summary_to_dict(self, summary: ThreeMfSummary) -> dict[str, Any]:
@@ -634,7 +846,10 @@ class MainWindow(QMainWindow):
         )
 
     def get_row_copies(self, row: int) -> int:
-        item = self.table.item(row, 1)
+        widget = self.table.cellWidget(row, COPIES_COLUMN)
+        if isinstance(widget, QSpinBox):
+            return max(1, int(widget.value()))
+        item = self.table.item(row, COPIES_COLUMN)
         if item is None:
             return 1
         try:
@@ -643,12 +858,28 @@ class MainWindow(QMainWindow):
             return 1
 
     def set_row_copies(self, row: int, copies: int) -> None:
-        item = self.table.item(row, 1)
+        value = max(1, int(copies))
+        widget = self.table.cellWidget(row, COPIES_COLUMN)
+        if isinstance(widget, QSpinBox):
+            widget.setValue(value)
+            return
+        item = self.table.item(row, COPIES_COLUMN)
         if item is not None:
-            item.setText(str(max(1, int(copies))))
+            item.setText(str(value))
+
+    def on_row_copies_changed(self, row: int, copies: int) -> None:
+        if self._updating_table:
+            return
+        self._updating_table = True
+        try:
+            self.update_row_stats(row)
+        finally:
+            self._updating_table = False
+        self.update_total_summary()
+        self.update_output_preview()
 
     def update_row_stats(self, row: int) -> None:
-        path_item = self.table.item(row, 0)
+        path_item = self.table.item(row, FILE_COLUMN)
         if path_item is None:
             return
         data = path_item.data(SUMMARY_ROLE)
@@ -662,13 +893,13 @@ class MainWindow(QMainWindow):
         total_prediction = None if summary.prediction_seconds is None else summary.prediction_seconds * copies
         total_weight = None if summary.weight_grams is None else summary.weight_grams * copies
         total_used_m = None if summary.filament_used_m is None else summary.filament_used_m * copies
-        self.table.item(row, 2).setText(format_duration(total_prediction))
-        self.table.item(row, 3).setText(format_filament(total_weight, total_used_m))
+        self.table.item(row, TIME_COLUMN).setText(format_duration(total_prediction))
+        self.table.item(row, FILAMENT_COLUMN).setText(format_filament(total_weight, total_used_m))
 
     def on_table_item_changed(self, item: QTableWidgetItem) -> None:
         if self._updating_table:
             return
-        if item.column() == 1:
+        if item.column() == COPIES_COLUMN:
             self._updating_table = True
             try:
                 copies = self.get_row_copies(item.row())
@@ -688,48 +919,54 @@ class MainWindow(QMainWindow):
 
     def remove_selected(self) -> None:
         rows = sorted(self.selected_rows(), reverse=True)
+        next_row = min(rows) if rows else None
         for row in rows:
             self.table.removeRow(row)
+        self.update_order_controls()
+        if next_row is not None and self.table.rowCount() > 0:
+            self.table.selectRow(min(next_row, self.table.rowCount() - 1))
         self.update_total_summary()
         self.update_output_preview()
+        self.update_thumbnail_preview()
 
     def remove_all(self) -> None:
         self.table.setRowCount(0)
+        self.update_order_controls()
         self.update_total_summary()
         self.update_output_preview()
+        self.update_thumbnail_preview()
 
     def move_selected(self, delta: int) -> None:
         row = self.selected_row()
         if row is None:
             return
+        self.move_row(row, delta)
+
+    def move_row(self, row: int, delta: int) -> None:
         new_row = row + delta
         if new_row < 0 or new_row >= self.table.rowCount():
             return
-        row_values: list[tuple[str, Any, Any, str]] = []
+        copies = self.get_row_copies(row)
+        row_items: list[QTableWidgetItem | None] = []
         for col in range(self.table.columnCount()):
             item = self.table.item(row, col)
-            row_values.append((item.text() if item else "", item.flags() if item else Qt.ItemIsEnabled, item.data(SUMMARY_ROLE) if item else None, item.toolTip() if item else ""))
+            row_items.append(item.clone() if item is not None else None)
         self._updating_table = True
         try:
             self.table.removeRow(row)
             self.table.insertRow(new_row)
-            for col, (text, flags, data, tooltip) in enumerate(row_values):
-                item = QTableWidgetItem(text)
-                item.setFlags(flags)
-                if col in {1}:
-                    item.setTextAlignment(Qt.AlignCenter)
-                elif col in {2, 3}:
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if data is not None:
-                    item.setData(SUMMARY_ROLE, data)
-                if tooltip:
-                    item.setToolTip(tooltip)
-                self.table.setItem(new_row, col, item)
+            for col, item in enumerate(row_items):
+                if item is not None:
+                    self.table.setItem(new_row, col, item)
+            self.table.setCellWidget(new_row, COPIES_COLUMN, self.create_copies_spin(new_row, copies))
+            self.table.setRowHeight(new_row, 38)
         finally:
             self._updating_table = False
+        self.update_order_controls()
         self.table.selectRow(new_row)
         self.update_total_summary()
         self.update_output_preview()
+        self.update_thumbnail_preview()
 
     def apply_default_copies_to_selected(self) -> None:
         rows = self.selected_rows()
@@ -747,8 +984,9 @@ class MainWindow(QMainWindow):
 
     def choose_output_dir(self) -> None:
         start_dir = self.output_dir_edit.text().strip()
-        if not start_dir and self.table.rowCount() > 0 and self.table.item(0, 0):
-            start_dir = str(Path(self.table.item(0, 0).text()).parent)
+        first_path = self.row_path(0) if self.table.rowCount() > 0 else None
+        if not start_dir and first_path is not None:
+            start_dir = str(first_path.parent)
         directory = QFileDialog.getExistingDirectory(self, "Choose output directory", start_dir or "")
         if directory:
             self.output_dir_edit.setText(directory)
@@ -756,17 +994,18 @@ class MainWindow(QMainWindow):
     def collect_jobs(self) -> list[PlateJob]:
         jobs: list[PlateJob] = []
         for row in range(self.table.rowCount()):
-            path_item = self.table.item(row, 0)
-            if path_item is None:
+            path = self.row_path(row)
+            if path is None:
                 continue
-            jobs.append(PlateJob(Path(path_item.text()), self.get_row_copies(row)))
+            jobs.append(PlateJob(path, self.get_row_copies(row)))
         return jobs
 
     def summary_for_path(self, path: Path) -> ThreeMfSummary:
         normalized = str(path)
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item is not None and item.text() == normalized:
+            row_path = self.row_path(row)
+            item = self.table.item(row, FILE_COLUMN)
+            if row_path is not None and str(row_path) == normalized and item is not None:
                 data = item.data(SUMMARY_ROLE)
                 if isinstance(data, ThreeMfSummary):
                     return data
@@ -795,19 +1034,19 @@ class MainWindow(QMainWindow):
     def update_output_preview(self) -> None:
         jobs = self.collect_jobs()
         if not jobs:
-            self.output_preview_label.setText("Output path preview: -")
+            self.output_preview_label.setText("-")
             return
         try:
             if self.individual_batch_check.isChecked():
                 first_path = resolve_output_path([jobs[0]], self.output_naming_options(), self.summary_for_path)
                 self.output_preview_label.setText(
-                    f"Individual batch preview: {first_path} | {len(jobs)} output file(s)"
+                    f"{first_path} | {len(jobs)} output file(s)"
                 )
             else:
                 output_path = resolve_output_path(jobs, self.output_naming_options(), self.summary_for_path)
-                self.output_preview_label.setText(f"Output path preview: {output_path}")
+                self.output_preview_label.setText(str(output_path))
         except Exception as exc:
-            self.output_preview_label.setText(f"Output path preview: {exc}")
+            self.output_preview_label.setText(str(exc))
 
     def build_options_for_output(self, output_path: Path) -> BuildOptions:
         swap_gcode_path = self.swap_gcode_combo.currentData()
