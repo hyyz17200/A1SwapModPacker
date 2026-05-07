@@ -11,7 +11,7 @@ if sys.platform.startswith("win") and "QT_QPA_PLATFORM" not in os.environ:
     os.environ["QT_QPA_PLATFORM"] = "windows:fontengine=freetype"
 
 try:
-    from PySide6.QtCore import QEvent, Qt, QUrl
+    from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, Qt, QTimer, QUrl
     from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont
     from PySide6.QtWidgets import (
         QApplication,
@@ -20,6 +20,7 @@ try:
         QComboBox,
         QFileDialog,
         QFormLayout,
+        QGraphicsOpacityEffect,
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
@@ -61,6 +62,87 @@ from .planning import (
 )
 
 SUMMARY_ROLE = Qt.UserRole + 100
+
+
+class SuccessToast(QLabel):
+    FADE_MS = 1000
+    HOLD_MS = 5000
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setWordWrap(True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setStyleSheet(
+            """
+            QLabel {
+                background: #f4fff6;
+                color: #183f22;
+                border: 3px solid #2e7d32;
+                border-radius: 8px;
+                padding: 20px 32px;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            """
+        )
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity_effect)
+        self._fade_in = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+        self._fade_in.setDuration(self.FADE_MS)
+        self._fade_in.setEasingCurve(QEasingCurve.InOutQuad)
+        self._fade_out = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+        self._fade_out.setDuration(self.FADE_MS)
+        self._fade_out.setEasingCurve(QEasingCurve.InOutQuad)
+        self._fade_out.finished.connect(self.hide)
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._start_fade_out)
+        parent.installEventFilter(self)
+        self.hide()
+
+    def show_message(self, message: str) -> None:
+        self._hold_timer.stop()
+        self._fade_in.stop()
+        self._fade_out.stop()
+        self.setText(message)
+        self._fit_to_parent()
+        self._position()
+        self._opacity_effect.setOpacity(0.0)
+        self.show()
+        self.raise_()
+        self._fade_in.setStartValue(0.0)
+        self._fade_in.setEndValue(1.0)
+        self._fade_in.start()
+        self._hold_timer.start(self.FADE_MS + self.HOLD_MS)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if watched is self.parentWidget() and event.type() == QEvent.Resize and self.isVisible():
+            self._fit_to_parent()
+            self._position()
+        return super().eventFilter(watched, event)
+
+    def _fit_to_parent(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.setMaximumWidth(max(360, min(720, parent.width() - 48)))
+        self.adjustSize()
+
+    def _position(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        margin = 24
+        x = max(margin, (parent.width() - self.width()) // 2)
+        y = max(margin, parent.height() - self.height() - margin)
+        self.move(x, y)
+
+    def _start_fade_out(self) -> None:
+        self._fade_out.stop()
+        self._fade_out.setStartValue(self._opacity_effect.opacity())
+        self._fade_out.setEndValue(0.0)
+        self._fade_out.start()
 
 
 class DropTableWidget(QTableWidget):
@@ -323,6 +405,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.log)
 
         self.setCentralWidget(central)
+        self.success_toast = SuccessToast(central)
 
     def connect_option_signals(self) -> None:
         self.swap_gcode_combo.currentIndexChanged.connect(self.save_current_settings)
@@ -749,6 +832,9 @@ class MainWindow(QMainWindow):
         self.log.append(f"Estimated source filament: {format_filament(result.total_weight_grams)}")
         self.log.append(f"G-code MD5: {result.gcode_md5}")
 
+    def show_success_toast(self, message: str) -> None:
+        self.success_toast.show_message(message)
+
     def build_output(self) -> None:
         jobs = self.collect_jobs()
         if not jobs:
@@ -770,7 +856,7 @@ class MainWindow(QMainWindow):
         options = self.build_options_for_output(output_path)
         result = build_packed_3mf(jobs, options)
         self.log_build_result(result)
-        QMessageBox.information(self, APP_NAME, "The packed 3MF file was created.")
+        self.show_success_toast("The packed 3MF file was created.")
         if self.clear_after_build_check.isChecked():
             self.remove_all()
 
@@ -800,7 +886,7 @@ class MainWindow(QMainWindow):
                 + ("\n..." if len(errors) > 8 else ""),
             )
             return
-        QMessageBox.information(self, APP_NAME, f"Created {success_count} packed 3MF file(s).")
+        self.show_success_toast(f"Created {success_count} packed 3MF file(s).")
         if self.clear_after_build_check.isChecked():
             self.remove_all()
 
