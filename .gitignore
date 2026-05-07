@@ -15,4 +15,5 @@ Thumbs.db
 
 *.bak
 /settings.json
+/reference
 codec.py

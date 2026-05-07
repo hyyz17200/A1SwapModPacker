@@ -54,6 +54,27 @@ def read_filament_metadata(archive: zipfile.ZipFile) -> dict[int, dict[str, str]
     return result
 
 
+def read_model_settings_gcode_members(archive: zipfile.ZipFile) -> list[str]:
+    try:
+        data = archive.read("Metadata/model_settings.config")
+    except KeyError:
+        return []
+    try:
+        root = ET.fromstring(data.decode("utf-8-sig", errors="replace"))
+    except Exception:
+        return []
+    members: list[str] = []
+    for plate in root.findall("plate"):
+        for metadata in plate.findall("metadata"):
+            if metadata.attrib.get("key") != "gcode_file":
+                continue
+            value = metadata.attrib.get("value", "").strip().replace("\\", "/").lstrip("/")
+            if value and GCODE_MEMBER_RE.match(value):
+                members.append(value)
+            break
+    return members
+
+
 def safe_float(value: str | None) -> float | None:
     if value is None:
         return None

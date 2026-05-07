@@ -17,7 +17,13 @@ from .gcode import (
     read_swap_gcode_file,
     resolve_swap_gcode_path,
 )
-from .metadata import read_filament_metadata, read_slice_plate_metadata, safe_float, update_first_slice_info
+from .metadata import (
+    read_filament_metadata,
+    read_model_settings_gcode_members,
+    read_slice_plate_metadata,
+    safe_float,
+    update_first_slice_info,
+)
 from .models import BuildOptions, BuildResult, GcodePatchConfig, PlateJob, PlateSource
 from .patches import apply_gcode_patches, parse_patch_config
 
@@ -128,9 +134,35 @@ def update_preview_label(png_bytes: bytes, label: str, small: bool = False) -> b
     return output.getvalue()
 
 
+def resolve_output_gcode_member(archive: zipfile.ZipFile, fallback_member: str) -> str:
+    configured_members = read_model_settings_gcode_members(archive)
+    if fallback_member in configured_members:
+        return fallback_member
+    existing_members = set(list_gcode_members(archive))
+    for member in configured_members:
+        if member in existing_members:
+            return member
+    if configured_members:
+        return configured_members[0]
+    return fallback_member
+
+
+def preview_members_for_gcode_member(gcode_member: str) -> set[str]:
+    match = GCODE_MEMBER_RE.match(gcode_member)
+    if not match:
+        return set()
+    plate_index = match.group(1)
+    return {
+        f"Metadata/plate_{plate_index}.png",
+        f"Metadata/plate_{plate_index}_small.png",
+    }
+
+
 def write_output_3mf(base_3mf: Path, output_3mf: Path, gcode_bytes: bytes, sources: list[PlateSource], options: BuildOptions) -> str:
     md5 = hashlib.md5(gcode_bytes).hexdigest()
     with zipfile.ZipFile(base_3mf, "r") as src, zipfile.ZipFile(output_3mf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as dst:
+        gcode_member = resolve_output_gcode_member(src, sources[0].member_name)
+        preview_members = preview_members_for_gcode_member(gcode_member)
         for item in src.infolist():
             name = item.filename
             if GCODE_MEMBER_RE.match(name) or MD5_MEMBER_RE.match(name):
@@ -138,11 +170,11 @@ def write_output_3mf(base_3mf: Path, output_3mf: Path, gcode_bytes: bytes, sourc
             data = src.read(name)
             if name == "Metadata/slice_info.config":
                 data = update_first_slice_info(data, sources, options)
-            elif options.add_preview_label and name in {"Metadata/plate_1.png", "Metadata/plate_1_small.png"}:
+            elif options.add_preview_label and name in preview_members:
                 data = update_preview_label(data, f"{len(sources)} plates", small=name.endswith("_small.png"))
             dst.writestr(item, data)
-        dst.writestr("Metadata/plate_1.gcode", gcode_bytes)
-        dst.writestr("Metadata/plate_1.gcode.md5", md5)
+        dst.writestr(gcode_member, gcode_bytes)
+        dst.writestr(f"{gcode_member}.md5", md5)
     return md5
 
 
