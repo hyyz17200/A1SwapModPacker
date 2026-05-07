@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -33,6 +34,9 @@ except Exception:  # pragma: no cover
     Image = None
     ImageDraw = None
     ImageFont = None
+
+PREVIEW_MEMBER_RE = re.compile(r"^Metadata/plate_(\d+)(?:_small)?\.png$", re.IGNORECASE)
+MAX_COMPOSITE_PREVIEW_INPUTS = 9
 
 
 def load_plate_sources(job: PlateJob) -> list[PlateSource]:
@@ -99,6 +103,14 @@ def process_plate_gcode(
     return text.rstrip("\n") + "\n"
 
 
+def save_png_bytes(image: object) -> bytes:
+    import io
+
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 def update_preview_label(png_bytes: bytes, label: str, small: bool = False) -> bytes:
     if Image is None or ImageDraw is None:
         return png_bytes
@@ -129,9 +141,133 @@ def update_preview_label(png_bytes: bytes, label: str, small: bool = False) -> b
     x = margin
     y = image.height - margin - (text_bbox[3] - text_bbox[1])
     draw.text((x, y), label, font=font, fill=(0, 255, 0, 255))
-    output = io.BytesIO()
-    image.save(output, format="PNG")
-    return output.getvalue()
+    return save_png_bytes(image)
+
+
+def preview_member_name_for_gcode_member(gcode_member: str, small: bool = False) -> str | None:
+    match = GCODE_MEMBER_RE.match(gcode_member)
+    if not match:
+        return None
+    suffix = "_small" if small else ""
+    return f"Metadata/plate_{match.group(1)}{suffix}.png"
+
+
+def preview_member_sort_key(member_name: str) -> tuple[int, int, str]:
+    match = PREVIEW_MEMBER_RE.match(member_name)
+    plate_number = int(match.group(1)) if match else 9999
+    is_small = 1 if member_name.lower().endswith("_small.png") else 0
+    return (is_small, plate_number, member_name.lower())
+
+
+def select_preview_sources(sources: list[PlateSource], max_inputs: int = MAX_COMPOSITE_PREVIEW_INPUTS) -> list[PlateSource]:
+    selected: list[PlateSource] = []
+    seen_paths: set[Path] = set()
+    for source in sources:
+        key = source.source_3mf.resolve(strict=False)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        selected.append(source)
+        if len(selected) >= max_inputs:
+            break
+    return selected
+
+
+def source_preview_member(archive: zipfile.ZipFile, source: PlateSource, small: bool = False) -> str | None:
+    names = set(archive.namelist())
+    active_member = resolve_output_gcode_member(archive, source.member_name)
+    preferred = preview_member_name_for_gcode_member(active_member, small)
+    if preferred in names:
+        return preferred
+    alternate = preview_member_name_for_gcode_member(active_member, not small)
+    if alternate in names:
+        return alternate
+
+    candidates = [
+        name
+        for name in names
+        if PREVIEW_MEMBER_RE.match(name) and name.lower().endswith("_small.png") == small
+    ]
+    if not candidates:
+        candidates = [name for name in names if PREVIEW_MEMBER_RE.match(name)]
+    if not candidates:
+        candidates = [
+            name
+            for name in names
+            if name.lower().startswith("metadata/") and name.lower().endswith(".png")
+        ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=preview_member_sort_key)[0]
+
+
+def read_source_preview_image(source: PlateSource, small: bool = False) -> object | None:
+    if Image is None:
+        return None
+    import io
+
+    try:
+        with zipfile.ZipFile(source.source_3mf, "r") as archive:
+            member = source_preview_member(archive, source, small)
+            if member is None:
+                return None
+            data = archive.read(member)
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception:
+        return None
+
+
+def preview_grid_dimensions(count: int) -> tuple[int, int]:
+    if count <= 1:
+        return (1, 1)
+    if count <= 2:
+        return (2, 1)
+    if count <= 4:
+        return (2, 2)
+    return (3, (count + 2) // 3)
+
+
+def resize_image_to_fit(image: object, width: int, height: int) -> object:
+    resized = image.copy()
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+    resized.thumbnail((max(1, width), max(1, height)), resampling)
+    return resized
+
+
+def compose_preview_image(png_bytes: bytes, sources: list[PlateSource], label: str, small: bool = False) -> bytes:
+    if Image is None:
+        return png_bytes
+    import io
+
+    try:
+        base_image = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    except Exception:
+        return update_preview_label(png_bytes, label, small)
+
+    source_images = [
+        image
+        for image in (read_source_preview_image(source, small) for source in select_preview_sources(sources))
+        if image is not None
+    ]
+    if not source_images:
+        return update_preview_label(png_bytes, label, small)
+
+    width, height = base_image.size
+    canvas = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+    columns, rows = preview_grid_dimensions(len(source_images))
+    for index, image in enumerate(source_images):
+        column = index % columns
+        row = index // columns
+        left = width * column // columns
+        right = width * (column + 1) // columns
+        top = height * row // rows
+        bottom = height * (row + 1) // rows
+        fitted = resize_image_to_fit(image, right - left, bottom - top)
+        x = left + max(0, (right - left - fitted.width) // 2)
+        y = top + max(0, (bottom - top - fitted.height) // 2)
+        canvas.paste(fitted, (x, y), fitted)
+
+    return update_preview_label(save_png_bytes(canvas), label, small)
 
 
 def resolve_output_gcode_member(archive: zipfile.ZipFile, fallback_member: str) -> str:
@@ -148,14 +284,11 @@ def resolve_output_gcode_member(archive: zipfile.ZipFile, fallback_member: str) 
 
 
 def preview_members_for_gcode_member(gcode_member: str) -> set[str]:
-    match = GCODE_MEMBER_RE.match(gcode_member)
-    if not match:
+    full_member = preview_member_name_for_gcode_member(gcode_member, small=False)
+    small_member = preview_member_name_for_gcode_member(gcode_member, small=True)
+    if full_member is None or small_member is None:
         return set()
-    plate_index = match.group(1)
-    return {
-        f"Metadata/plate_{plate_index}.png",
-        f"Metadata/plate_{plate_index}_small.png",
-    }
+    return {full_member, small_member}
 
 
 def write_output_3mf(base_3mf: Path, output_3mf: Path, gcode_bytes: bytes, sources: list[PlateSource], options: BuildOptions) -> str:
@@ -171,7 +304,7 @@ def write_output_3mf(base_3mf: Path, output_3mf: Path, gcode_bytes: bytes, sourc
             if name == "Metadata/slice_info.config":
                 data = update_first_slice_info(data, sources, options)
             elif options.add_preview_label and name in preview_members:
-                data = update_preview_label(data, f"{len(sources)} plates", small=name.endswith("_small.png"))
+                data = compose_preview_image(data, sources, f"{len(sources)} P", small=name.endswith("_small.png"))
             dst.writestr(item, data)
         dst.writestr(gcode_member, gcode_bytes)
         dst.writestr(f"{gcode_member}.md5", md5)
