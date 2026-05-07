@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import APP_NAME
+from . import APP_NAME, APP_TITLE, __version__
 from .core import (
     BuildOptions,
     PlateJob,
@@ -70,7 +70,11 @@ def list_swap_gcode_command(args: argparse.Namespace) -> int:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="a1-swap-mod-packer", description="Pack repeated Bambu A1 SwapMod plates into one 3MF job.")
+    parser = argparse.ArgumentParser(
+        prog="a1-swap-mod-packer",
+        description=f"{APP_TITLE} - Pack repeated Bambu A1 SwapMod plates into one 3MF job.",
+    )
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     build = subparsers.add_parser("build", help="Build a packed 3MF file.")

@@ -43,7 +43,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("PySide6 is required to run the GUI. Install it with: pip install PySide6") from exc
 
-from . import APP_NAME
+from . import APP_NAME, APP_TITLE
 from .core import (
     BuildOptions,
     PlateJob,
@@ -265,7 +265,7 @@ class DropTableWidget(QTableWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(APP_TITLE)
         self.resize(960, 860)
         self.setAcceptDrops(True)
         self._updating_table = False
