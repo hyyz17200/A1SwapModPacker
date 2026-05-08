@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from .archive import GCODE_MEMBER_RE, MD5_MEMBER_RE, list_gcode_members
@@ -25,7 +26,7 @@ from .metadata import (
     safe_float,
     update_first_slice_info,
 )
-from .models import BuildOptions, BuildResult, GcodePatchConfig, PlateJob, PlateSource
+from .models import DEFAULT_ZIP_COMPRESS_LEVEL, BuildOptions, BuildResult, GcodePatchConfig, PlateJob, PlateSource
 from .patches import apply_gcode_patches, parse_patch_config
 
 try:
@@ -37,6 +38,34 @@ except Exception:  # pragma: no cover
 
 PREVIEW_MEMBER_RE = re.compile(r"^Metadata/plate_(\d+)(?:_small)?\.png$", re.IGNORECASE)
 MAX_COMPOSITE_PREVIEW_INPUTS = 9
+MIN_ZIP_COMPRESS_LEVEL = 1
+MAX_ZIP_COMPRESS_LEVEL = 9
+
+
+def normalized_zip_compress_level(level: int | None) -> int:
+    try:
+        value = int(level if level is not None else DEFAULT_ZIP_COMPRESS_LEVEL)
+    except (TypeError, ValueError):
+        value = DEFAULT_ZIP_COMPRESS_LEVEL
+    return min(MAX_ZIP_COMPRESS_LEVEL, max(MIN_ZIP_COMPRESS_LEVEL, value))
+
+
+def load_zlib_ng_module() -> object:
+    try:
+        from zlib_ng import zlib_ng
+    except ImportError as exc:  # pragma: no cover - exercised when dependency is missing
+        raise RuntimeError("zlib-ng is required for 3MF ZIP compression. Install it with: pip install zlib-ng") from exc
+    return zlib_ng
+
+
+@contextmanager
+def use_zlib_ng_for_zipfile() -> object:
+    original_zlib = zipfile.zlib
+    zipfile.zlib = load_zlib_ng_module()
+    try:
+        yield
+    finally:
+        zipfile.zlib = original_zlib
 
 
 def load_plate_sources(job: PlateJob) -> list[PlateSource]:
@@ -293,21 +322,28 @@ def preview_members_for_gcode_member(gcode_member: str) -> set[str]:
 
 def write_output_3mf(base_3mf: Path, output_3mf: Path, gcode_bytes: bytes, sources: list[PlateSource], options: BuildOptions) -> str:
     md5 = hashlib.md5(gcode_bytes).hexdigest()
-    with zipfile.ZipFile(base_3mf, "r") as src, zipfile.ZipFile(output_3mf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as dst:
-        gcode_member = resolve_output_gcode_member(src, sources[0].member_name)
-        preview_members = preview_members_for_gcode_member(gcode_member)
-        for item in src.infolist():
-            name = item.filename
-            if GCODE_MEMBER_RE.match(name) or MD5_MEMBER_RE.match(name):
-                continue
-            data = src.read(name)
-            if name == "Metadata/slice_info.config":
-                data = update_first_slice_info(data, sources, options)
-            elif options.add_preview_label and name in preview_members:
-                data = compose_preview_image(data, sources, f"{len(sources)} P", small=name.endswith("_small.png"))
-            dst.writestr(item, data)
-        dst.writestr(gcode_member, gcode_bytes)
-        dst.writestr(f"{gcode_member}.md5", md5)
+    compress_level = normalized_zip_compress_level(options.zip_compress_level)
+    with use_zlib_ng_for_zipfile():
+        with zipfile.ZipFile(base_3mf, "r") as src, zipfile.ZipFile(
+            output_3mf,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=compress_level,
+        ) as dst:
+            gcode_member = resolve_output_gcode_member(src, sources[0].member_name)
+            preview_members = preview_members_for_gcode_member(gcode_member)
+            for item in src.infolist():
+                name = item.filename
+                if GCODE_MEMBER_RE.match(name) or MD5_MEMBER_RE.match(name):
+                    continue
+                data = src.read(name)
+                if name == "Metadata/slice_info.config":
+                    data = update_first_slice_info(data, sources, options)
+                elif options.add_preview_label and name in preview_members:
+                    data = compose_preview_image(data, sources, f"{len(sources)} P", small=name.endswith("_small.png"))
+                dst.writestr(item, data)
+            dst.writestr(gcode_member, gcode_bytes)
+            dst.writestr(f"{gcode_member}.md5", md5)
     return md5
 
 

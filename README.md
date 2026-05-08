@@ -26,6 +26,7 @@ It takes one or more A1-sliced `.3mf` files, repeats their plate G-code accordin
 - Optional remaining-time plate-number encoding through `M73 R...`.
 - Combined mode: all input rows become one packed 3MF.
 - Individual batch mode: every input row becomes its own packed 3MF.
+- zlib-ng Deflate ZIP compression level, defaulting to Level 7.
 - GUI settings are saved to the program folder as `settings.json`.
 
 ## Installation for source use
@@ -352,6 +353,7 @@ Saved options include:
 - Final swap switch.
 - G-code patch switch.
 - Metadata mode.
+- ZIP compression level.
 - Individual batch mode.
 - Input handling options.
 - Output directory.

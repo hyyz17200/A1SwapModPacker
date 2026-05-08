@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 DEFAULT_INSERT_BEFORE_MARKER = ";=====printer finish  sound========="
+DEFAULT_ZIP_COMPRESS_LEVEL = 7
 
 MetadataMode = Literal["source", "sum"]
 LineEnding = Literal["lf", "crlf"]
@@ -45,6 +46,7 @@ class BuildOptions:
     add_preview_label: bool = True
     apply_gcode_patches: bool = True
     swap_gcode_dir: Path | None = None
+    zip_compress_level: int = DEFAULT_ZIP_COMPRESS_LEVEL
 
 
 @dataclass

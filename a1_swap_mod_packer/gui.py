@@ -46,6 +46,7 @@ except ImportError as exc:  # pragma: no cover
 from . import APP_NAME, APP_TITLE
 from .core import (
     BuildOptions,
+    DEFAULT_ZIP_COMPRESS_LEVEL,
     PlateJob,
     ThreeMfSummary,
     build_packed_3mf,
@@ -446,6 +447,14 @@ class MainWindow(QMainWindow):
         self.metadata_combo.setFixedWidth(260)
         options_layout.addRow("3MF metadata", self.metadata_combo)
 
+        self.zip_level_combo = QComboBox()
+        for level in range(1, 10):
+            self.zip_level_combo.addItem(f"Level {level}", level)
+        self.zip_level_combo.setCurrentIndex(DEFAULT_ZIP_COMPRESS_LEVEL - 1)
+        self.zip_level_combo.setFixedWidth(120)
+        self.zip_level_combo.setToolTip("zlib-ng Deflate compression level for the output 3MF.")
+        options_layout.addRow("ZIP compression", self.zip_level_combo)
+
         self.individual_batch_check = QCheckBox("Individual batch mode")
         self.individual_batch_check.setToolTip(
             "Build each input row as a separate output file, using that row's copy count."
@@ -528,6 +537,7 @@ class MainWindow(QMainWindow):
         self.swap_final_check.stateChanged.connect(self.save_current_settings)
         self.patch_check.stateChanged.connect(self.save_current_settings)
         self.metadata_combo.currentIndexChanged.connect(self.save_current_settings)
+        self.zip_level_combo.currentIndexChanged.connect(self.save_current_settings)
         self.individual_batch_check.stateChanged.connect(self.on_individual_batch_toggled)
         self.clear_after_build_check.stateChanged.connect(self.save_current_settings)
         self.skip_duplicates_check.stateChanged.connect(self.save_current_settings)
@@ -554,6 +564,13 @@ class MainWindow(QMainWindow):
         metadata_index = self.metadata_combo.findData(metadata_mode)
         if metadata_index >= 0:
             self.metadata_combo.setCurrentIndex(metadata_index)
+        try:
+            zip_level = int(options.get("zip_compress_level", DEFAULT_ZIP_COMPRESS_LEVEL))
+        except (TypeError, ValueError):
+            zip_level = DEFAULT_ZIP_COMPRESS_LEVEL
+        zip_level_index = self.zip_level_combo.findData(min(9, max(1, zip_level)))
+        if zip_level_index >= 0:
+            self.zip_level_combo.setCurrentIndex(zip_level_index)
         swap_gcode = options.get("swap_gcode") or self._settings.get("last_swap_gcode")
         if swap_gcode:
             index = self.swap_gcode_combo.findData(str(swap_gcode))
@@ -573,6 +590,7 @@ class MainWindow(QMainWindow):
             "swap_after_final": self.swap_final_check.isChecked(),
             "apply_gcode_patches": self.patch_check.isChecked(),
             "metadata_mode": self.metadata_combo.currentData(),
+            "zip_compress_level": int(self.zip_level_combo.currentData() or DEFAULT_ZIP_COMPRESS_LEVEL),
             "individual_batch_mode": self.individual_batch_check.isChecked(),
             "clear_after_build": self.clear_after_build_check.isChecked(),
             "skip_duplicates": self.skip_duplicates_check.isChecked(),
@@ -1062,6 +1080,7 @@ class MainWindow(QMainWindow):
             swap_after_final=self.swap_final_check.isChecked(),
             metadata_mode=self.metadata_combo.currentData(),
             apply_gcode_patches=self.patch_check.isChecked(),
+            zip_compress_level=int(self.zip_level_combo.currentData() or DEFAULT_ZIP_COMPRESS_LEVEL),
         )
 
     def log_build_result(self, result: Any) -> None:

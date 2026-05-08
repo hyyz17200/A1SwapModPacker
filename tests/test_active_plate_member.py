@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path
 
 from a1_swap_mod_packer.builder import (
+    normalized_zip_compress_level,
     preview_members_for_gcode_member,
     resolve_output_gcode_member,
     select_preview_sources,
@@ -61,6 +62,44 @@ class ActivePlateMemberTest(unittest.TestCase):
                 self.assertEqual(archive.read("Metadata/plate_2.gcode"), gcode_bytes)
                 self.assertEqual(archive.read("Metadata/plate_2.gcode.md5").decode(), md5)
                 self.assertEqual(md5, hashlib.md5(gcode_bytes).hexdigest())
+
+    def test_write_output_honors_zip_compression_level(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_3mf = root / "plate2.3mf"
+            level_1_output = root / "level1.3mf"
+            level_7_output = root / "level7.3mf"
+            self.write_plate2_archive(source_3mf)
+            sources = [
+                PlateSource(
+                    source_3mf=source_3mf,
+                    member_name="Metadata/plate_2.gcode",
+                    gcode_text="G1 X0\n",
+                )
+            ]
+            gcode_bytes = (b"G1 X123.456 Y789.012 E0.03456 ; repeated movement\n" * 20000)
+
+            for output_3mf, zip_level in ((level_1_output, 1), (level_7_output, 7)):
+                options = BuildOptions(
+                    swap_gcode="",
+                    output_3mf=output_3mf,
+                    add_preview_label=False,
+                    apply_gcode_patches=False,
+                    zip_compress_level=zip_level,
+                )
+                write_output_3mf(source_3mf, output_3mf, gcode_bytes, sources, options)
+
+            with zipfile.ZipFile(level_1_output, "r") as level_1_archive, zipfile.ZipFile(level_7_output, "r") as level_7_archive:
+                level_1_info = level_1_archive.getinfo("Metadata/plate_2.gcode")
+                level_7_info = level_7_archive.getinfo("Metadata/plate_2.gcode")
+                self.assertEqual(level_1_info.compress_type, zipfile.ZIP_DEFLATED)
+                self.assertEqual(level_7_info.compress_type, zipfile.ZIP_DEFLATED)
+                self.assertLess(level_7_info.compress_size, level_1_info.compress_size)
+
+    def test_zip_compression_level_is_clamped(self) -> None:
+        self.assertEqual(normalized_zip_compress_level(None), 7)
+        self.assertEqual(normalized_zip_compress_level(0), 1)
+        self.assertEqual(normalized_zip_compress_level(10), 9)
 
     def test_preview_composite_uses_first_nine_unique_input_files(self) -> None:
         if Image is None:

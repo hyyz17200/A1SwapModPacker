@@ -33,6 +33,7 @@ from .metadata import (
 )
 from .models import (
     DEFAULT_INSERT_BEFORE_MARKER,
+    DEFAULT_ZIP_COMPRESS_LEVEL,
     BuildOptions,
     BuildResult,
     BuildSummary,
@@ -59,6 +60,7 @@ from .planning import (
 __all__ = [
     "DEFAULT_INSERT_BEFORE_MARKER",
     "DEFAULT_OUTPUT_PATTERN",
+    "DEFAULT_ZIP_COMPRESS_LEVEL",
     "GCODE_MEMBER_RE",
     "M73_RE",
     "MD5_MEMBER_RE",

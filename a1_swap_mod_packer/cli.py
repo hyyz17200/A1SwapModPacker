@@ -7,6 +7,7 @@ from pathlib import Path
 from . import APP_NAME, APP_TITLE, __version__
 from .core import (
     BuildOptions,
+    DEFAULT_ZIP_COMPRESS_LEVEL,
     PlateJob,
     build_packed_3mf,
     list_swap_gcode_files,
@@ -46,6 +47,7 @@ def build_command(args: argparse.Namespace) -> int:
         add_preview_label=not args.no_preview_label,
         apply_gcode_patches=not args.no_gcode_patches,
         swap_gcode_dir=Path(args.swap_gcode_dir) if args.swap_gcode_dir else None,
+        zip_compress_level=args.zip_level,
     )
     result = build_packed_3mf(jobs, options)
     print(f"Output: {result.output_3mf}")
@@ -91,6 +93,7 @@ def create_parser() -> argparse.ArgumentParser:
     build.add_argument("--no-swap-after-final", action="store_true", help="Do not run the swap G-code after the last plate.")
     build.add_argument("--metadata-mode", choices=("source", "sum"), default="source", help="How to write slice_info prediction and weight.")
     build.add_argument("--line-ending", choices=("lf", "crlf"), default="crlf", help="Line ending for the generated G-code.")
+    build.add_argument("--zip-level", type=int, choices=range(1, 10), default=DEFAULT_ZIP_COMPRESS_LEVEL, metavar="1-9", help="zlib-ng Deflate compression level for the output 3MF. Default: 7.")
     build.add_argument("--no-preview-label", action="store_true", help="Do not add a plate-count label to the first preview image.")
     build.add_argument("--no-gcode-patches", action="store_true", help=f"Do not apply editable patches from {default_patch_config_path()}.")
     build.set_defaults(func=build_command)
