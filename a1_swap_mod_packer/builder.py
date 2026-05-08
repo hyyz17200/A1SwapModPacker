@@ -120,9 +120,25 @@ def process_plate_gcode(
     swap_gcode_text: str,
     patch_config: GcodePatchConfig,
 ) -> str:
+    text = _prepare_plate_gcode(source, options, patch_config)
+    return _process_prepared_plate_gcode(text, plate_number, total_plates, options, swap_gcode_text, patch_config)
+
+
+def _prepare_plate_gcode(source: PlateSource, options: BuildOptions, patch_config: GcodePatchConfig) -> str:
     text = normalize_newlines(source.gcode_text)
     if options.apply_gcode_patches:
         text = apply_gcode_patches(text, patch_config)
+    return text
+
+
+def _process_prepared_plate_gcode(
+    text: str,
+    plate_number: int,
+    total_plates: int,
+    options: BuildOptions,
+    swap_gcode_text: str,
+    patch_config: GcodePatchConfig,
+) -> str:
     if options.show_plate_number:
         text = apply_plate_number_offset(text, plate_number)
     should_swap = options.swap_after_final or plate_number < total_plates
@@ -130,6 +146,10 @@ def process_plate_gcode(
         swap_block = build_swap_block(swap_gcode_text, options.cool_bed_temp, options.wait_after_eject_seconds)
         text = insert_swap_block(text, swap_block, patch_config.insert_before_marker)
     return text.rstrip("\n") + "\n"
+
+
+def _plate_gcode_cache_key(source: PlateSource) -> tuple[Path, str]:
+    return (source.source_3mf.resolve(strict=False), source.member_name)
 
 
 def save_png_bytes(image: object) -> bytes:
@@ -353,8 +373,23 @@ def build_packed_3mf(jobs: list[PlateJob], options: BuildOptions) -> BuildResult
     swap_gcode_text = read_swap_gcode_file(swap_gcode_path)
     patch_config = parse_patch_config() if options.apply_gcode_patches else GcodePatchConfig(rules=())
     processed: list[str] = []
+    prepared_gcode_cache: dict[tuple[Path, str], str] = {}
     for plate_number, source in enumerate(sources, start=1):
-        processed.append(process_plate_gcode(source, plate_number, len(sources), options, swap_gcode_text, patch_config))
+        cache_key = _plate_gcode_cache_key(source)
+        prepared_text = prepared_gcode_cache.get(cache_key)
+        if prepared_text is None:
+            prepared_text = _prepare_plate_gcode(source, options, patch_config)
+            prepared_gcode_cache[cache_key] = prepared_text
+        processed.append(
+            _process_prepared_plate_gcode(
+                prepared_text,
+                plate_number,
+                len(sources),
+                options,
+                swap_gcode_text,
+                patch_config,
+            )
+        )
     final_gcode = "\n".join(item.rstrip("\n") for item in processed) + "\n"
     gcode_bytes = apply_line_ending(final_gcode, options.line_ending)
     output_3mf = options.output_3mf
