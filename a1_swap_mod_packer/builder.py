@@ -7,15 +7,17 @@ import shutil
 import tempfile
 import zipfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from .archive import GCODE_MEMBER_RE, MD5_MEMBER_RE, list_gcode_members
 from .gcode import (
+    M73OffsetTemplate,
     apply_line_ending,
-    apply_plate_number_offset,
     build_swap_block,
     insert_swap_block,
     normalize_newlines,
+    prepare_m73_offset_template,
     read_swap_gcode_file,
     resolve_swap_gcode_path,
 )
@@ -40,6 +42,12 @@ PREVIEW_MEMBER_RE = re.compile(r"^Metadata/plate_(\d+)(?:_small)?\.png$", re.IGN
 MAX_COMPOSITE_PREVIEW_INPUTS = 9
 MIN_ZIP_COMPRESS_LEVEL = 1
 MAX_ZIP_COMPRESS_LEVEL = 9
+
+
+@dataclass(frozen=True)
+class _PreparedPlateGcode:
+    text: str
+    m73_template: M73OffsetTemplate | None = None
 
 
 def normalized_zip_compress_level(level: int | None) -> int:
@@ -120,27 +128,40 @@ def process_plate_gcode(
     swap_gcode_text: str,
     patch_config: GcodePatchConfig,
 ) -> str:
-    text = _prepare_plate_gcode(source, options, patch_config)
-    return _process_prepared_plate_gcode(text, plate_number, total_plates, options, swap_gcode_text, patch_config)
+    prepared = _prepare_plate_gcode(source, options, patch_config)
+    return _process_prepared_plate_gcode(
+        prepared,
+        plate_number,
+        total_plates,
+        options,
+        swap_gcode_text,
+        patch_config,
+    )
 
 
-def _prepare_plate_gcode(source: PlateSource, options: BuildOptions, patch_config: GcodePatchConfig) -> str:
+def _prepare_plate_gcode(
+    source: PlateSource,
+    options: BuildOptions,
+    patch_config: GcodePatchConfig,
+) -> _PreparedPlateGcode:
     text = normalize_newlines(source.gcode_text)
     if options.apply_gcode_patches:
         text = apply_gcode_patches(text, patch_config)
-    return text
+    m73_template = prepare_m73_offset_template(text) if options.show_plate_number else None
+    return _PreparedPlateGcode(text, m73_template)
 
 
 def _process_prepared_plate_gcode(
-    text: str,
+    prepared: _PreparedPlateGcode,
     plate_number: int,
     total_plates: int,
     options: BuildOptions,
     swap_gcode_text: str,
     patch_config: GcodePatchConfig,
 ) -> str:
-    if options.show_plate_number:
-        text = apply_plate_number_offset(text, plate_number)
+    text = prepared.text
+    if options.show_plate_number and prepared.m73_template is not None:
+        text = prepared.m73_template.apply(plate_number)
     should_swap = options.swap_after_final or plate_number < total_plates
     if should_swap:
         swap_block = build_swap_block(swap_gcode_text, options.cool_bed_temp, options.wait_after_eject_seconds)
@@ -373,7 +394,7 @@ def build_packed_3mf(jobs: list[PlateJob], options: BuildOptions) -> BuildResult
     swap_gcode_text = read_swap_gcode_file(swap_gcode_path)
     patch_config = parse_patch_config() if options.apply_gcode_patches else GcodePatchConfig(rules=())
     processed: list[str] = []
-    prepared_gcode_cache: dict[tuple[Path, str], str] = {}
+    prepared_gcode_cache: dict[tuple[Path, str], _PreparedPlateGcode] = {}
     for plate_number, source in enumerate(sources, start=1):
         cache_key = _plate_gcode_cache_key(source)
         prepared_text = prepared_gcode_cache.get(cache_key)

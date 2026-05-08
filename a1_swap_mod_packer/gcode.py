@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import DEFAULT_INSERT_BEFORE_MARKER, LineEnding
@@ -73,13 +74,37 @@ def format_filament(weight_grams: float | None, used_m: float | None = None) -> 
     return " / ".join(parts)
 
 
+@dataclass(frozen=True)
+class M73OffsetTemplate:
+    segments: tuple[str, ...]
+    base_remaining_minutes: tuple[int, ...]
+
+    def apply(self, plate_number: int) -> str:
+        if not self.base_remaining_minutes:
+            return self.segments[0]
+        minute_offset = plate_number * 100 * 60
+        parts: list[str] = []
+        for index, remaining_minutes in enumerate(self.base_remaining_minutes):
+            parts.append(self.segments[index])
+            parts.append(str(remaining_minutes + minute_offset))
+        parts.append(self.segments[-1])
+        return "".join(parts)
+
+
+def prepare_m73_offset_template(gcode: str) -> M73OffsetTemplate:
+    segments: list[str] = []
+    base_remaining_minutes: list[int] = []
+    last_index = 0
+    for match in M73_RE.finditer(gcode):
+        segments.append(gcode[last_index : match.start(2)])
+        base_remaining_minutes.append(int(match.group(2)))
+        last_index = match.end(2)
+    segments.append(gcode[last_index:])
+    return M73OffsetTemplate(tuple(segments), tuple(base_remaining_minutes))
+
+
 def apply_plate_number_offset(gcode: str, plate_number: int) -> str:
-    minute_offset = plate_number * 100 * 60
-
-    def replace(match: re.Match[str]) -> str:
-        return f"{match.group(1)}{int(match.group(2)) + minute_offset}{match.group(3)}"
-
-    return M73_RE.sub(replace, gcode)
+    return prepare_m73_offset_template(gcode).apply(plate_number)
 
 
 def build_swap_block(swap_gcode: str, cool_bed_temp: int | None, wait_seconds: int) -> str:
