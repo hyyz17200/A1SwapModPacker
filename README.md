@@ -1,5 +1,7 @@
 # A1 Swap Mod Packer
 
+Current version: **v0.5.0**
+
 A1 Swap Mod Packer is an open-source implementation 3MF packer for Bambu Lab A1 SwapMod workflows.
 
 It takes one or more A1-sliced `.3mf` files, repeats their plate G-code according to copy counts, inserts an external SwapMod ejection/swap G-code block, and writes a new packed `.3mf` that can be sent to the printer.
@@ -24,6 +26,8 @@ It takes one or more A1-sliced `.3mf` files, repeats their plate G-code accordin
 - External SwapMod G-code template folder.
 - Editable G-code patch file.
 - Optional remaining-time plate-number encoding through `M73 R...`.
+- Selected-input thumbnail preview in the GUI.
+- Packed preview image composition from up to 9 unique input files, with a short `{plates} P` label.
 - Combined mode: all input rows become one packed 3MF.
 - Individual batch mode: every input row becomes its own packed 3MF.
 - zlib-ng Deflate ZIP compression level, defaulting to Level 7.
@@ -33,11 +37,22 @@ It takes one or more A1-sliced `.3mf` files, repeats their plate G-code accordin
 
 Python 3.10 or newer is recommended.    
 
-Install dependency:
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Current runtime dependencies:
+
+| Dependency | Used for |
+|---|---|
+| `PySide6` | GUI application, drag-and-drop table, file dialogs, thumbnail preview, and settings UI |
+| `Pillow` | Reading and composing PNG preview images inside the output 3MF, including the `{plates} P` label |
+| `zlib-ng` | Required ZIP Deflate backend for writing compressed 3MF files and honoring the compression level |
+
+No Java runtime, Bambu Studio SDK, external archive tool, or encrypted/template decoder is required by the current Python source version.
+
 Run the GUI:
 
 ```bash
@@ -62,6 +77,105 @@ or
 python run_cli.py
 ```
 
+Show the version:
+
+```bash
+python -m a1_swap_mod_packer.cli --version
+```
+
+## Build Windows executables
+
+The repository includes a Windows build script:
+
+```cmd
+build_win.cmd
+```
+
+The script uses Nuitka onefile mode and creates this portable release folder:
+
+```text
+build/onefile/
+```
+
+Expected output:
+
+```text
+build/onefile/
+  a1packer.exe
+  a1packer-cli.exe
+  gcode_patches.ini
+  swap_gcode/
+  settings.json      Optional; created by the GUI after settings are saved
+```
+
+External resources are intentionally kept outside the executables. Do not pack these files into the onefile binary:
+
+```text
+swap_gcode/
+gcode_patches.ini
+settings.json
+```
+
+The application resolves these paths from the executable folder when running as a packaged exe.
+
+### Windows build requirements
+
+Tested build environment:
+
+- Windows 10.
+- Python 3.10 or newer.
+- A virtual environment at `.venv/`.
+- Project runtime dependencies from `requirements.txt`.
+- Nuitka with onefile support.
+- Microsoft C++ Build Tools / Visual Studio Build Tools with the MSVC compiler and Windows SDK.
+
+Install the Python dependencies in a fresh virtual environment:
+
+```cmd
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install "Nuitka[onefile]"
+```
+
+Then run:
+
+```cmd
+build_win.cmd
+```
+
+The build script performs two Nuitka builds:
+
+- GUI: `run_gui.py` -> `build/onefile/a1packer.exe`
+- CLI: `run_cli.py` -> `build/onefile/a1packer-cli.exe`
+
+The GUI build enables the PySide6 plugin and includes the Qt plugin groups needed by the current interface:
+
+```text
+platforms,imageformats,styles,iconengines
+```
+
+### After building
+
+Before publishing the folder, verify the CLI can see the external resources:
+
+```cmd
+build\onefile\a1packer-cli.exe --version
+build\onefile\a1packer-cli.exe list-swap-gcode
+```
+
+The second command should list files from:
+
+```text
+build/onefile/swap_gcode/
+```
+
+Also start `build/onefile/a1packer.exe` once and confirm that:
+
+- The Swap G-code dropdown lists the copied templates.
+- Editing GUI options creates or updates `build/onefile/settings.json`.
+- The app still runs if `settings.json` is absent before first launch.
+
 ## Swap G-code templates
 
 The GUI automatically scans this fixed folder:
@@ -70,7 +184,16 @@ The GUI automatically scans this fixed folder:
 swap_gcode/
 ```
 
-Plain UTF-8 G-code files are read directly.
+Plain UTF-8 text files are read directly. The current scanner accepts these suffixes:
+
+```text
+.gcode
+.nc
+.ngc
+.txt
+```
+
+The current source version does not decode encrypted or vendor-template G-code archives.
 
 In the GUI:
 
@@ -142,6 +265,8 @@ Metadata/slice_info.config
 If the source 3MF lacks this metadata, the GUI shows `Unknown`.
 
 The summary line under the input list shows the total plate count, estimated time, and filament for the current table.
+
+The right-side thumbnail panel shows the selected input file's active plate preview when one is available in the 3MF.
 
 ### Build 3MF button
 
@@ -235,6 +360,21 @@ Options:
 
 - **Sum prediction and filament**  
   Updates the first plate metadata using the sum of all repeated source plates. This is more logically correct for statistics, but may differ from the vendor software.
+
+### Preview image handling
+
+By default, the output 3MF keeps the base archive preview members for the active output plate and rewrites those PNG previews with:
+
+- a composite of up to 9 unique input-file preview images;
+- a short green label such as `5 P`, applied once to the final composite.
+
+If preview images are missing or cannot be read, the packer keeps the available base preview and still tries to apply the short plate label.
+
+The CLI can disable preview rewriting with:
+
+```bash
+--no-preview-label
+```
 
 ### Batch mode
 
@@ -363,6 +503,12 @@ Saved options include:
 
 ## CLI examples
 
+List available Swap G-code files:
+
+```bash
+python -m a1_swap_mod_packer.cli list-swap-gcode
+```
+
 Build one source with five copies:
 
 ```bash
@@ -404,4 +550,52 @@ python -m a1_swap_mod_packer.cli build \
   --no-gcode-patches \
   -o "5 Plates - A.3mf"
 ```
+
+Build positional inputs with the same copy count:
+
+```bash
+python -m a1_swap_mod_packer.cli build \
+  "A.3mf" "B.3mf" \
+  --copies 2 \
+  --swap-gcode "a1_swap.gcode" \
+  -o "4 Plates - A_and_B.3mf"
+```
+
+Use an explicit Swap G-code folder and ZIP compression level:
+
+```bash
+python -m a1_swap_mod_packer.cli build \
+  --item "A.3mf" 5 \
+  --swap-gcode "a1_swap.gcode" \
+  --swap-gcode-dir "D:\SwapMod\swap_gcode" \
+  --zip-level 9 \
+  -o "5 Plates - A.3mf"
+```
+
+Disable final swap and preview label rewriting:
+
+```bash
+python -m a1_swap_mod_packer.cli build \
+  --item "A.3mf" 5 \
+  --swap-gcode "a1_swap.gcode" \
+  --no-swap-after-final \
+  --no-preview-label \
+  -o "5 Plates - A.3mf"
+```
+
+Useful CLI options:
+
+| Option | Meaning |
+|---|---|
+| `--version` | Print the current version |
+| `list-swap-gcode` | List files found in the Swap G-code folder |
+| `--item PATH COPIES` | Add one input with its own copy count; can be repeated |
+| positional `inputs` + `--copies N` | Add multiple inputs with the same copy count |
+| `--swap-gcode-dir DIR` | Use a custom Swap G-code folder |
+| `--no-bed-cooldown` | Do not insert `M190` before the swap block |
+| `--no-swap-after-final` | Do not run the swap block after the final plate |
+| `--line-ending lf|crlf` | Choose generated G-code line endings; default is `crlf` |
+| `--zip-level 1-9` | zlib-ng Deflate compression level; default is `7` |
+| `--no-preview-label` | Do not rewrite the preview image label/composite |
+| `--no-gcode-patches` | Do not apply rules from `gcode_patches.ini` |
 

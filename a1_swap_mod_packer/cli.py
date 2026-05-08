@@ -94,7 +94,7 @@ def create_parser() -> argparse.ArgumentParser:
     build.add_argument("--metadata-mode", choices=("source", "sum"), default="source", help="How to write slice_info prediction and weight.")
     build.add_argument("--line-ending", choices=("lf", "crlf"), default="crlf", help="Line ending for the generated G-code.")
     build.add_argument("--zip-level", type=int, choices=range(1, 10), default=DEFAULT_ZIP_COMPRESS_LEVEL, metavar="1-9", help="zlib-ng Deflate compression level for the output 3MF. Default: 7.")
-    build.add_argument("--no-preview-label", action="store_true", help="Do not add a plate-count label to the first preview image.")
+    build.add_argument("--no-preview-label", action="store_true", help="Do not rewrite the preview image label/composite.")
     build.add_argument("--no-gcode-patches", action="store_true", help=f"Do not apply editable patches from {default_patch_config_path()}.")
     build.set_defaults(func=build_command)
 
