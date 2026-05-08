@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import zipfile
+from multiprocessing import freeze_support
 from pathlib import Path
 from typing import Any, Callable
 
@@ -44,6 +45,7 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit("PySide6 is required to run the GUI. Install it with: pip install PySide6") from exc
 
 from . import APP_NAME, APP_TITLE
+from .batch import IndividualBuildTask, individual_batch_worker_count, run_individual_batch_builds
 from .core import (
     BuildOptions,
     DEFAULT_ZIP_COMPRESS_LEVEL,
@@ -1122,6 +1124,7 @@ class MainWindow(QMainWindow):
         used_paths: set[Path] = set()
         success_count = 0
         errors: list[str] = []
+        tasks: list[IndividualBuildTask] = []
         for job in jobs:
             try:
                 output_path = make_unique_for_run(
@@ -1129,12 +1132,23 @@ class MainWindow(QMainWindow):
                     used_paths,
                 )
                 options = self.build_options_for_output(output_path)
-                result = build_packed_3mf([job], options)
-                self.log_build_result(result)
-                success_count += 1
             except Exception as exc:
                 errors.append(f"{job.source_3mf.name}: {exc}")
                 self.log.append(f"Error building {job.source_3mf}: {exc}")
+                continue
+            tasks.append(IndividualBuildTask(job, options))
+
+        if tasks:
+            worker_count = individual_batch_worker_count(len(tasks))
+            self.log.append(f"Building {len(tasks)} individual output(s) with {worker_count} worker(s).")
+            batch_result = run_individual_batch_builds(tasks, max_workers=worker_count)
+            for result in batch_result.results:
+                self.log_build_result(result)
+            success_count = len(batch_result.results)
+            for failure in batch_result.failures:
+                errors.append(f"{failure.job.source_3mf.name}: {failure.error}")
+                self.log.append(f"Error building {failure.job.source_3mf}: {failure.error}")
+
         if errors:
             QMessageBox.warning(
                 self,
@@ -1166,6 +1180,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    freeze_support()
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
     window = MainWindow()

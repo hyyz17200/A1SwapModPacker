@@ -281,6 +281,8 @@ Output:
 
 This is intended for quickly converting a large batch of independent single-plate 3MF files into multi-copy SwapMod packs.
 
+The GUI builds these independent outputs in parallel, capped by CPU count and a small safety limit.
+
 It does **not** combine all inputs into one file.
 
 ### Input handling
